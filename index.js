@@ -207,11 +207,63 @@ function handleMessage(ws, data) {
       break;
     }
 
+    case 'c:addAI': {
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can add AI' });
+      if (room.state !== 'lobby') return send(ws, { type: 's:error', message: 'Cannot add AI during game' });
+      if (room.players.length >= 6) return send(ws, { type: 's:error', message: 'Room is full' });
+
+      const aiNames = ['Bot Alpha', 'Bot Beta', 'Bot Gamma', 'Bot Delta', 'Bot Epsilon'];
+      const aiCount = room.players.filter(p => p.isAI).length;
+      const playerIndex = room.players.length;
+      room.players.push({
+        index: playerIndex,
+        name: msg.name || aiNames[aiCount % aiNames.length],
+        token: null,
+        ws: null,
+        connected: true,
+        monsterId: null,
+        isAI: true,
+      });
+      room.lastActivity = Date.now();
+      broadcast(room, lobbyState(room));
+      break;
+    }
+
+    case 'c:removeAI': {
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can remove AI' });
+      if (room.state !== 'lobby') return send(ws, { type: 's:error', message: 'Cannot remove AI during game' });
+
+      const target = room.players.find(p => p.index === msg.playerIndex && p.isAI);
+      if (!target) return send(ws, { type: 's:error', message: 'AI player not found' });
+
+      room.players = room.players.filter(p => p.index !== msg.playerIndex);
+      room.players.forEach((p, i) => { p.index = i; });
+      room.lastActivity = Date.now();
+      broadcast(room, lobbyState(room));
+      break;
+    }
+
     case 'c:start': {
       if (!ctx) return;
       const { room } = ctx;
       if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can start' });
       if (room.players.filter(p => p.connected || p.isAI).length < 2) return send(ws, { type: 's:error', message: 'Need 2+ players' });
+
+      // Auto-assign monsters to players without one (e.g. AI)
+      const allMonsters = ['king', 'gigazaur', 'mekadragon', 'cyberbunny', 'alienoid', 'kraken'];
+      const usedMonsters = new Set(room.players.filter(p => p.monsterId).map(p => p.monsterId));
+      const available = allMonsters.filter(m => !usedMonsters.has(m));
+      for (const p of room.players) {
+        if (!p.monsterId && available.length > 0) {
+          const idx = crypto.randomInt(available.length);
+          p.monsterId = available.splice(idx, 1)[0];
+        }
+      }
+
       const { cardDeckSeed, initialDice } = startGame(room);
       broadcast(room, {
         type: 's:gameStart',
@@ -219,6 +271,7 @@ function handleMessage(ws, data) {
         cardDeckSeed,
         initialDice,
         currentPlayerIndex: 0,
+        hostIndex: room.hostIndex,
       });
       break;
     }
@@ -303,7 +356,13 @@ function handleMessage(ws, data) {
 }
 
 function isPlayerTurn(ctx) {
-  return ctx.room.game && ctx.room.game.currentPlayerIndex === ctx.playerIndex;
+  if (!ctx.room.game) return false;
+  const currentIdx = ctx.room.game.currentPlayerIndex;
+  if (ctx.playerIndex === currentIdx) return true;
+  // Host can act on behalf of AI players
+  const currentPlayer = ctx.room.players[currentIdx];
+  if (ctx.playerIndex === ctx.room.hostIndex && currentPlayer && currentPlayer.isAI) return true;
+  return false;
 }
 
 // ── Disconnect Handling ──
