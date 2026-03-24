@@ -68,7 +68,7 @@ function createRoom(playerName) {
     ],
     config: null,
     game: null,
-    matchNumber: 0,
+    matchNumber: 1,
     lastActivity: Date.now(),
   };
   rooms.set(code, room);
@@ -139,7 +139,6 @@ function startGame(room) {
   const cardDeckSeed = crypto.randomInt(1_000_000_000);
   const firstTurnDice = prerollTurn();
   room.state = 'playing';
-  room.matchNumber++;
   room.game = {
     currentPlayerIndex: 0,
     round: 1,
@@ -213,7 +212,7 @@ function handleMessage(ws, data) {
       player.ws = ws;
       player.connected = true;
       ws._ctx = { room, playerIndex: player.index };
-      send(ws, { type: 's:reconnected', playerIndex: player.index, roomState: room.state });
+      send(ws, { type: 's:reconnected', playerIndex: player.index, roomState: room.state, matchNumber: room.matchNumber });
       if (room.state === 'playing') {
         send(ws, { type: 's:sync', game: { ...room.game, eliminated: [...room.game.eliminated] }, players: lobbyState(room).players, matchNumber: room.matchNumber });
       } else {
@@ -503,6 +502,7 @@ function handleMessage(ws, data) {
       if (room.state !== 'ended') return;
 
       // Reset eliminated state and start a fresh game
+      room.matchNumber++;
       const { cardDeckSeed, initialDice } = startGame(room);
       broadcast(room, {
         type: 's:gameStart',
