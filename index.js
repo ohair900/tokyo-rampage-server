@@ -68,6 +68,7 @@ function createRoom(playerName) {
     ],
     config: null,
     game: null,
+    matchNumber: 1,
     lastActivity: Date.now(),
   };
   rooms.set(code, room);
@@ -145,6 +146,8 @@ function startGame(room) {
     prerolledDice: firstTurnDice,
     rerollIndex: 0,
     cardDeckSeed,
+    deckIndex: 0,
+    eliminated: new Set(),
   };
   room.lastActivity = Date.now();
   return { cardDeckSeed, initialDice: firstTurnDice[0] };
@@ -152,8 +155,13 @@ function startGame(room) {
 
 function advanceTurn(room) {
   const g = room.game;
-  g.currentPlayerIndex = (g.currentPlayerIndex + 1) % room.players.length;
-  if (g.currentPlayerIndex === 0) g.round++;
+  const totalPlayers = room.players.length;
+  let attempts = 0;
+  do {
+    g.currentPlayerIndex = (g.currentPlayerIndex + 1) % totalPlayers;
+    if (g.currentPlayerIndex === 0) g.round++;
+    attempts++;
+  } while (g.eliminated.has(g.currentPlayerIndex) && attempts < totalPlayers);
   g.prerolledDice = prerollTurn();
   g.rerollIndex = 0;
   g.phase = 'rolling';
@@ -204,9 +212,9 @@ function handleMessage(ws, data) {
       player.ws = ws;
       player.connected = true;
       ws._ctx = { room, playerIndex: player.index };
-      send(ws, { type: 's:reconnected', playerIndex: player.index, roomState: room.state });
+      send(ws, { type: 's:reconnected', playerIndex: player.index, roomState: room.state, matchNumber: room.matchNumber });
       if (room.state === 'playing') {
-        send(ws, { type: 's:sync', game: room.game, players: lobbyState(room).players });
+        send(ws, { type: 's:sync', game: { ...room.game, eliminated: [...room.game.eliminated] }, players: lobbyState(room).players, matchNumber: room.matchNumber });
       } else {
         broadcast(room, lobbyState(room));
       }
@@ -348,6 +356,7 @@ function handleMessage(ws, data) {
         currentPlayerIndex: 0,
         hostIndex: room.hostIndex,
         aiDifficulty: msg.aiDifficulty || 'normal',
+        matchNumber: room.matchNumber,
       });
       break;
     }
@@ -380,6 +389,8 @@ function handleMessage(ws, data) {
 
     case 'c:yieldDecision': {
       if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      if (ctx.room.game.phase !== 'resolving') return;
       broadcast(ctx.room, { type: 's:yieldResult', playerIndex: ctx.playerIndex, yielded: msg.yielded }, ctx.playerIndex);
       break;
     }
@@ -387,27 +398,84 @@ function handleMessage(ws, data) {
     case 'c:buyCard': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex }, ctx.playerIndex);
+      if (ctx.room.game) ctx.room.game.deckIndex++;
+      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex, cardId: msg.cardId });
       break;
     }
 
     case 'c:sweepStore': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      broadcast(ctx.room, { type: 's:storeSweep', playerIndex: ctx.playerIndex }, ctx.playerIndex);
+      if (ctx.room.game) ctx.room.game.deckIndex += 3;
+      broadcast(ctx.room, { type: 's:storeSweep', playerIndex: ctx.playerIndex });
       break;
     }
 
     case 'c:rapidHeal': {
       if (!ctx || !isPlayerTurn(ctx)) return;
-      broadcast(ctx.room, { type: 's:rapidHeal', playerIndex: ctx.playerIndex }, ctx.playerIndex);
+      broadcast(ctx.room, { type: 's:rapidHeal', playerIndex: ctx.playerIndex });
+      break;
+    }
+
+    case 'c:useCard': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardUsed',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId,
+        targetIndex: msg.targetIndex ?? null,
+        params: msg.params ?? {},
+      });
+      break;
+    }
+
+    case 'c:promptCardResponse': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      if (ctx.playerIndex !== ctx.room.hostIndex) return;
+      broadcast(ctx.room, {
+        type: 's:promptCardResponse',
+        targetIndex: msg.targetIndex,
+        context: msg.context,
+        eligibleCards: msg.eligibleCards,
+      });
+      break;
+    }
+
+    case 'c:cardResponse': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardResponse',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId ?? null,
+        declined: msg.declined ?? false,
+      });
+      break;
+    }
+
+    case 'c:discardCard': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardDiscarded',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId,
+      });
       break;
     }
 
     case 'c:endBuy': {
       if (!ctx || !isPlayerTurn(ctx)) return;
+      if (ctx.room.state === 'ended') return;
+      if (ctx.room.game.phase !== 'resolving') return;
       ctx.room.lastActivity = Date.now();
       advanceTurn(ctx.room);
+      if (ctx.room.state === 'ended') return;
       const g = ctx.room.game;
       broadcast(ctx.room, {
         type: 's:turnAdvance',
@@ -420,8 +488,67 @@ function handleMessage(ws, data) {
 
     case 'c:gameOver': {
       if (!ctx) return;
+      if (ctx.room.state === 'ended') return;
+      if (ctx.playerIndex !== ctx.room.hostIndex) return;
       ctx.room.state = 'ended';
       broadcast(ctx.room, { type: 's:gameOver', winnerIndex: msg.winnerIndex });
+      break;
+    }
+
+    case 'c:nextMatch': {
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can start next match' });
+      if (room.state !== 'ended') return;
+
+      // Reset eliminated state and start a fresh game
+      room.matchNumber++;
+      const { cardDeckSeed, initialDice } = startGame(room);
+      broadcast(room, {
+        type: 's:gameStart',
+        players: room.players.map(p => ({ index: p.index, name: p.name, monsterId: p.monsterId, isAI: p.isAI })),
+        cardDeckSeed,
+        initialDice,
+        currentPlayerIndex: 0,
+        hostIndex: room.hostIndex,
+        aiDifficulty: msg.aiDifficulty || 'normal',
+        matchNumber: room.matchNumber,
+      });
+      break;
+    }
+
+    case 'c:eliminatePlayer': {
+      if (!ctx) return;
+      const { room } = ctx;
+      if (room.state !== 'playing' || !room.game) return;
+      if (ctx.playerIndex !== room.hostIndex) return;
+      const eliminatedIdx = msg.playerIndex;
+      if (eliminatedIdx == null || eliminatedIdx < 0 || eliminatedIdx >= room.players.length) return;
+      if (room.game.eliminated.has(eliminatedIdx)) return;
+
+      room.game.eliminated.add(eliminatedIdx);
+      broadcast(room, { type: 's:playerEliminated', playerIndex: eliminatedIdx });
+
+      // Check if only one player remains alive
+      const alive = room.players.filter(p => !room.game.eliminated.has(p.index));
+      if (alive.length <= 1) {
+        room.state = 'ended';
+        const winnerIndex = alive.length === 1 ? alive[0].index : -1;
+        broadcast(room, { type: 's:gameOver', winnerIndex });
+        return;
+      }
+
+      // If the eliminated player was the current turn player, auto-advance
+      if (eliminatedIdx === room.game.currentPlayerIndex) {
+        advanceTurn(room);
+        const g = room.game;
+        broadcast(room, {
+          type: 's:turnAdvance',
+          nextPlayerIndex: g.currentPlayerIndex,
+          round: g.round,
+          initialDice: g.prerolledDice[0],
+        });
+      }
       break;
     }
 
@@ -432,6 +559,7 @@ function handleMessage(ws, data) {
 
 function isPlayerTurn(ctx) {
   if (!ctx.room.game) return false;
+  if (ctx.room.game.eliminated.has(ctx.playerIndex)) return false;
   const currentIdx = ctx.room.game.currentPlayerIndex;
   if (ctx.playerIndex === currentIdx) return true;
   // Host can act on behalf of AI players
