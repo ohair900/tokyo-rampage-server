@@ -5,7 +5,7 @@ import crypto from 'crypto';
 const PORT = process.env.PORT || 3001;
 const DICE_FACES = ['1', '2', '3', 'claw', 'heart', 'lightning'];
 const ROOM_TTL = 30 * 60 * 1000; // 30 min
-const DISCONNECT_TIMEOUT = 60 * 1000; // 60s before AI takeover
+const AI_NAMES = ['Bot Alpha', 'Bot Beta', 'Bot Gamma', 'Bot Delta', 'Bot Epsilon'];
 
 // ── Room Storage ──
 
@@ -28,6 +28,31 @@ function prerollTurn(numDice = 6) {
   return [rollDice(numDice), rollDice(numDice), rollDice(numDice)];
 }
 
+function makeAISlot(index) {
+  const aiCount = index - 1; // host is 0
+  return {
+    index,
+    name: AI_NAMES[aiCount % AI_NAMES.length],
+    token: null,
+    ws: null,
+    connected: true,
+    monsterId: null,
+    isAI: true,
+  };
+}
+
+function makeOpenSlot(index) {
+  return {
+    index,
+    name: '',
+    token: null,
+    ws: null,
+    connected: false,
+    monsterId: null,
+    isAI: false,
+  };
+}
+
 // ── Room Management ──
 
 function createRoom(playerName) {
@@ -37,15 +62,10 @@ function createRoom(playerName) {
     code,
     state: 'lobby',
     hostIndex: 0,
-    players: [{
-      index: 0,
-      name: playerName,
-      token,
-      ws: null,
-      connected: false,
-      monsterId: null,
-      isAI: false,
-    }],
+    players: [
+      { index: 0, name: playerName, token, ws: null, connected: false, monsterId: null, isAI: false },
+      makeAISlot(1),
+    ],
     config: null,
     game: null,
     lastActivity: Date.now(),
@@ -58,21 +78,17 @@ function joinRoom(code, playerName) {
   const room = rooms.get(code);
   if (!room) return { error: 'Room not found' };
   if (room.state !== 'lobby') return { error: 'Game already in progress' };
-  if (room.players.filter(p => !p.isAI).length >= 6) return { error: 'Room is full' };
+
+  // Find first open human slot (not AI, not connected, no token)
+  const openSlot = room.players.find(p => !p.isAI && !p.connected && !p.token);
+  if (!openSlot) return { error: 'No open slots available' };
 
   const token = crypto.randomUUID();
-  const playerIndex = room.players.length;
-  room.players.push({
-    index: playerIndex,
-    name: playerName,
-    token,
-    ws: null,
-    connected: false,
-    monsterId: null,
-    isAI: false,
-  });
+  openSlot.name = playerName;
+  openSlot.token = token;
+  // ws and connected will be set after this returns
   room.lastActivity = Date.now();
-  return { room, token, playerIndex };
+  return { room, token, playerIndex: openSlot.index };
 }
 
 function reconnectPlayer(code, token) {
@@ -111,6 +127,7 @@ function lobbyState(room) {
       connected: p.connected,
       monsterId: p.monsterId,
       isAI: p.isAI,
+      isOpen: !p.isAI && !p.connected && !p.token, // unfilled human slot
     })),
   };
 }
@@ -135,7 +152,6 @@ function startGame(room) {
 
 function advanceTurn(room) {
   const g = room.game;
-  // Move to next player (skip dead — client handles this, server just tracks index)
   g.currentPlayerIndex = (g.currentPlayerIndex + 1) % room.players.length;
   if (g.currentPlayerIndex === 0) g.round++;
   g.prerolledDice = prerollTurn();
@@ -151,7 +167,7 @@ function handleMessage(ws, data) {
   try { msg = JSON.parse(data); } catch { return send(ws, { type: 's:error', message: 'Invalid JSON' }); }
 
   const { type } = msg;
-  const ctx = ws._ctx; // attached room/player context
+  const ctx = ws._ctx;
 
   switch (type) {
     case 'c:create': {
@@ -162,6 +178,7 @@ function handleMessage(ws, data) {
       room.players[0].connected = true;
       ws._ctx = { room, playerIndex };
       send(ws, { type: 's:roomCreated', roomCode: room.code, playerToken: token, playerIndex });
+      broadcast(room, lobbyState(room));
       break;
     }
 
@@ -175,7 +192,6 @@ function handleMessage(ws, data) {
       room.players[playerIndex].connected = true;
       ws._ctx = { room, playerIndex };
       send(ws, { type: 's:joined', playerToken: token, playerIndex, roomCode: room.code });
-      broadcast(room, { type: 's:playerJoined', player: { index: playerIndex, name: playerName } }, playerIndex);
       broadcast(room, lobbyState(room));
       break;
     }
@@ -207,41 +223,97 @@ function handleMessage(ws, data) {
       break;
     }
 
-    case 'c:addAI': {
+    case 'c:updateName': {
+      if (!ctx) return;
+      const { name } = msg;
+      if (name && name.trim()) {
+        ctx.room.players[ctx.playerIndex].name = name.trim().slice(0, 20);
+        ctx.room.lastActivity = Date.now();
+        broadcast(ctx.room, lobbyState(ctx.room));
+      }
+      break;
+    }
+
+    case 'c:setPlayerCount': {
       if (!ctx) return;
       const { room } = ctx;
-      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can add AI' });
-      if (room.state !== 'lobby') return send(ws, { type: 's:error', message: 'Cannot add AI during game' });
-      if (room.players.length >= 6) return send(ws, { type: 's:error', message: 'Room is full' });
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can change player count' });
+      if (room.state !== 'lobby') return;
+      const count = Math.max(2, Math.min(6, msg.count));
 
-      const aiNames = ['Bot Alpha', 'Bot Beta', 'Bot Gamma', 'Bot Delta', 'Bot Epsilon'];
-      const aiCount = room.players.filter(p => p.isAI).length;
-      const playerIndex = room.players.length;
-      room.players.push({
-        index: playerIndex,
-        name: msg.name || aiNames[aiCount % aiNames.length],
-        token: null,
-        ws: null,
-        connected: true,
-        monsterId: null,
-        isAI: true,
-      });
+      // Growing: add AI slots
+      while (room.players.length < count) {
+        room.players.push(makeAISlot(room.players.length));
+      }
+      // Shrinking: remove from end (only AI or open slots)
+      while (room.players.length > count) {
+        const last = room.players[room.players.length - 1];
+        if (last.connected && !last.isAI) break; // can't remove connected human
+        room.players.pop();
+      }
+      // Re-index
+      room.players.forEach((p, i) => { p.index = i; });
       room.lastActivity = Date.now();
       broadcast(room, lobbyState(room));
       break;
     }
 
-    case 'c:removeAI': {
+    case 'c:setSlotType': {
       if (!ctx) return;
       const { room } = ctx;
-      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can remove AI' });
-      if (room.state !== 'lobby') return send(ws, { type: 's:error', message: 'Cannot remove AI during game' });
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can change slot types' });
+      if (room.state !== 'lobby') return;
+      const idx = msg.playerIndex;
+      const target = room.players[idx];
+      if (!target || idx === room.hostIndex) return; // can't change host slot
 
-      const target = room.players.find(p => p.index === msg.playerIndex && p.isAI);
-      if (!target) return send(ws, { type: 's:error', message: 'AI player not found' });
+      if (msg.slotType === 'ai') {
+        // Can only switch to AI if not a connected human
+        if (target.connected && !target.isAI) return;
+        const aiCount = room.players.filter(p => p.isAI).length;
+        target.isAI = true;
+        target.connected = true;
+        target.name = AI_NAMES[aiCount % AI_NAMES.length];
+        target.token = null;
+        target.ws = null;
+        target.monsterId = null;
+      } else {
+        // Switch to open human slot
+        target.isAI = false;
+        target.connected = false;
+        target.name = '';
+        target.token = null;
+        target.ws = null;
+        target.monsterId = null;
+      }
+      room.lastActivity = Date.now();
+      broadcast(room, lobbyState(room));
+      break;
+    }
 
-      room.players = room.players.filter(p => p.index !== msg.playerIndex);
-      room.players.forEach((p, i) => { p.index = i; });
+    case 'c:setSlotMonster': {
+      // Host sets monster for AI slots
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return;
+      if (room.state !== 'lobby') return;
+      const target = room.players[msg.playerIndex];
+      if (!target || !target.isAI) return;
+      target.monsterId = msg.monsterId;
+      room.lastActivity = Date.now();
+      broadcast(room, lobbyState(room));
+      break;
+    }
+
+    case 'c:setSlotName': {
+      // Host sets name for AI slots
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return;
+      if (room.state !== 'lobby') return;
+      const target = room.players[msg.playerIndex];
+      if (!target || !target.isAI) return;
+      target.name = (msg.name || '').trim().slice(0, 20);
       room.lastActivity = Date.now();
       broadcast(room, lobbyState(room));
       break;
@@ -251,9 +323,12 @@ function handleMessage(ws, data) {
       if (!ctx) return;
       const { room } = ctx;
       if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can start' });
+      // Check all human slots are filled
+      const hasOpenSlots = room.players.some(p => !p.isAI && !p.connected);
+      if (hasOpenSlots) return send(ws, { type: 's:error', message: 'Waiting for players to join' });
       if (room.players.filter(p => p.connected || p.isAI).length < 2) return send(ws, { type: 's:error', message: 'Need 2+ players' });
 
-      // Auto-assign monsters to players without one (e.g. AI)
+      // Auto-assign monsters to players without one
       const allMonsters = ['king', 'gigazaur', 'mekadragon', 'cyberbunny', 'alienoid', 'kraken'];
       const usedMonsters = new Set(room.players.filter(p => p.monsterId).map(p => p.monsterId));
       const available = allMonsters.filter(m => !usedMonsters.has(m));
@@ -272,6 +347,7 @@ function handleMessage(ws, data) {
         initialDice,
         currentPlayerIndex: 0,
         hostIndex: room.hostIndex,
+        aiDifficulty: msg.aiDifficulty || 'normal',
       });
       break;
     }
@@ -331,7 +407,6 @@ function handleMessage(ws, data) {
     case 'c:endBuy': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      // Advance turn, pre-roll next dice
       advanceTurn(ctx.room);
       const g = ctx.room.game;
       broadcast(ctx.room, {
@@ -376,6 +451,9 @@ function handleDisconnect(ws) {
     player.connected = false;
     player.ws = null;
     broadcast(room, { type: 's:playerDisconnected', playerIndex });
+    if (room.state === 'lobby') {
+      broadcast(room, lobbyState(room));
+    }
   }
 }
 
@@ -385,7 +463,6 @@ setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
     if (now - room.lastActivity > ROOM_TTL) {
-      // Close all connections
       for (const p of room.players) {
         if (p.ws) send(p.ws, { type: 's:roomClosed', reason: 'Inactivity timeout' });
       }
@@ -397,7 +474,6 @@ setInterval(() => {
 // ── HTTP + WebSocket Server ──
 
 const httpServer = createServer((req, res) => {
-  // Health check + CORS for wake-up ping
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
