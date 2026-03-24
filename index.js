@@ -393,14 +393,14 @@ function handleMessage(ws, data) {
     case 'c:buyCard': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex }, ctx.playerIndex);
+      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex });
       break;
     }
 
     case 'c:sweepStore': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      broadcast(ctx.room, { type: 's:storeSweep', playerIndex: ctx.playerIndex }, ctx.playerIndex);
+      broadcast(ctx.room, { type: 's:storeSweep', playerIndex: ctx.playerIndex });
       break;
     }
 
