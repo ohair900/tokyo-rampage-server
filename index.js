@@ -147,6 +147,7 @@ function startGame(room) {
     prerolledDice: firstTurnDice,
     rerollIndex: 0,
     cardDeckSeed,
+    deckIndex: 0,
     eliminated: new Set(),
   };
   room.lastActivity = Date.now();
@@ -389,6 +390,8 @@ function handleMessage(ws, data) {
 
     case 'c:yieldDecision': {
       if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      if (ctx.room.game.phase !== 'resolving') return;
       broadcast(ctx.room, { type: 's:yieldResult', playerIndex: ctx.playerIndex, yielded: msg.yielded }, ctx.playerIndex);
       break;
     }
@@ -396,26 +399,81 @@ function handleMessage(ws, data) {
     case 'c:buyCard': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
-      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex });
+      if (ctx.room.game) ctx.room.game.deckIndex++;
+      broadcast(ctx.room, { type: 's:cardBought', playerIndex: ctx.playerIndex, cardIndex: msg.cardIndex, cardId: msg.cardId });
       break;
     }
 
     case 'c:sweepStore': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       ctx.room.lastActivity = Date.now();
+      if (ctx.room.game) ctx.room.game.deckIndex += 3;
       broadcast(ctx.room, { type: 's:storeSweep', playerIndex: ctx.playerIndex });
       break;
     }
 
     case 'c:rapidHeal': {
       if (!ctx || !isPlayerTurn(ctx)) return;
-      broadcast(ctx.room, { type: 's:rapidHeal', playerIndex: ctx.playerIndex }, ctx.playerIndex);
+      broadcast(ctx.room, { type: 's:rapidHeal', playerIndex: ctx.playerIndex });
+      break;
+    }
+
+    case 'c:useCard': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardUsed',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId,
+        targetIndex: msg.targetIndex ?? null,
+        params: msg.params ?? {},
+      });
+      break;
+    }
+
+    case 'c:promptCardResponse': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      if (ctx.playerIndex !== ctx.room.hostIndex) return;
+      broadcast(ctx.room, {
+        type: 's:promptCardResponse',
+        targetIndex: msg.targetIndex,
+        context: msg.context,
+        eligibleCards: msg.eligibleCards,
+      });
+      break;
+    }
+
+    case 'c:cardResponse': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardResponse',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId ?? null,
+        declined: msg.declined ?? false,
+      });
+      break;
+    }
+
+    case 'c:discardCard': {
+      if (!ctx) return;
+      if (ctx.room.state !== 'playing' || !ctx.room.game) return;
+      ctx.room.lastActivity = Date.now();
+      broadcast(ctx.room, {
+        type: 's:cardDiscarded',
+        playerIndex: ctx.playerIndex,
+        cardId: msg.cardId,
+      });
       break;
     }
 
     case 'c:endBuy': {
       if (!ctx || !isPlayerTurn(ctx)) return;
       if (ctx.room.state === 'ended') return;
+      if (ctx.room.game.phase !== 'resolving') return;
       ctx.room.lastActivity = Date.now();
       advanceTurn(ctx.room);
       if (ctx.room.state === 'ended') return;
