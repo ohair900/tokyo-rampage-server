@@ -68,6 +68,7 @@ function createRoom(playerName) {
     ],
     config: null,
     game: null,
+    matchNumber: 0,
     lastActivity: Date.now(),
   };
   rooms.set(code, room);
@@ -138,6 +139,7 @@ function startGame(room) {
   const cardDeckSeed = crypto.randomInt(1_000_000_000);
   const firstTurnDice = prerollTurn();
   room.state = 'playing';
+  room.matchNumber++;
   room.game = {
     currentPlayerIndex: 0,
     round: 1,
@@ -212,7 +214,7 @@ function handleMessage(ws, data) {
       ws._ctx = { room, playerIndex: player.index };
       send(ws, { type: 's:reconnected', playerIndex: player.index, roomState: room.state });
       if (room.state === 'playing') {
-        send(ws, { type: 's:sync', game: { ...room.game, eliminated: [...room.game.eliminated] }, players: lobbyState(room).players });
+        send(ws, { type: 's:sync', game: { ...room.game, eliminated: [...room.game.eliminated] }, players: lobbyState(room).players, matchNumber: room.matchNumber });
       } else {
         broadcast(room, lobbyState(room));
       }
@@ -354,6 +356,7 @@ function handleMessage(ws, data) {
         currentPlayerIndex: 0,
         hostIndex: room.hostIndex,
         aiDifficulty: msg.aiDifficulty || 'normal',
+        matchNumber: room.matchNumber,
       });
       break;
     }
@@ -432,6 +435,27 @@ function handleMessage(ws, data) {
       if (ctx.playerIndex !== ctx.room.hostIndex) return;
       ctx.room.state = 'ended';
       broadcast(ctx.room, { type: 's:gameOver', winnerIndex: msg.winnerIndex });
+      break;
+    }
+
+    case 'c:nextMatch': {
+      if (!ctx) return;
+      const { room } = ctx;
+      if (ctx.playerIndex !== room.hostIndex) return send(ws, { type: 's:error', message: 'Only host can start next match' });
+      if (room.state !== 'ended') return;
+
+      // Reset eliminated state and start a fresh game
+      const { cardDeckSeed, initialDice } = startGame(room);
+      broadcast(room, {
+        type: 's:gameStart',
+        players: room.players.map(p => ({ index: p.index, name: p.name, monsterId: p.monsterId, isAI: p.isAI })),
+        cardDeckSeed,
+        initialDice,
+        currentPlayerIndex: 0,
+        hostIndex: room.hostIndex,
+        aiDifficulty: msg.aiDifficulty || 'normal',
+        matchNumber: room.matchNumber,
+      });
       break;
     }
 
